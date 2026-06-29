@@ -1,0 +1,82 @@
+Crie um MCP (Model Context Protocol) Server em Node.js (JavaScript, ES Modules) que liste vídeos públicos de contas do Instagram sem exigir autenticação.
+
+O projeto deve ser modular, limpo e estruturado nos seguintes arquivos sob a pasta `resources/mcps/instagram-videos`:
+- `package.json` (com scripts "start" e "postinstall": "npx playwright install chromium")
+- `index.js` (ponto de entrada unificado que gerencia CLI e servidor MCP via stdio)
+- `lib/browser.js` (gerenciamento do Chromium Playwright com anti-detecção)
+- `lib/scraper.js` (navegação no perfil e coleta de links com scroll infinito)
+- `lib/extractor.js` (abertura de cada post e extração de metadados)
+- `lib/csv.js` (leitura, escrita, merge e checkpoints do CSV)
+- `lib/retry.js` (lógica de retry com backoff exponencial)
+- `lib/logger.js` (logs organizados direcionados para stderr para não corromper o canal stdio do MCP)
+- `lib/utils.js` (funções utilitárias de limpeza e parsing)
+
+### Requisitos Técnicos Detalhados:
+
+1. TECNOLOGIA DE EXTRAÇÃO:
+   Use Playwright com Chromium. Configure argumentos anti-detecção (como desabilitar webdriver, definir user agent real do Chrome no Linux, viewport de 1280x900 e locale/timezone brasileira) para reduzir bloqueios. Bloqueie o download de fontes web (*.woff, *.woff2) para melhorar a performance. Não bloqueie imagens pois o Instagram depende delas para carregar a grade de posts.
+
+2. LOGIC DE SCROLL E DESVIOS DE BLOQUEIO:
+   - Ao navegar para o perfil, verifique se a página é "página não encontrada" e trate o erro.
+   - Implemente um loop de scroll suave (`window.scrollBy({ top: window.innerHeight * 2, behavior: 'smooth' })`).
+   - IMPORTANTE: O Instagram exibe modais de cookies e modais de login que travam o scroll. Crie seletores robustos para clicar nos botões de fechar ("Close", "Fechar", "Not Now", "Agora não", ou o último botão do modal de diálogo) e use fallback pressionando a tecla 'Escape' do teclado virtual.
+   - Faça a leitura dos links de posts coletando URLs que combinem com posts (`/p/CODE/`), reels (`/reel/CODE/`) ou vídeos de TV (`/tv/CODE/`), suportando também links com o prefixo do nome de usuário.
+
+3. EXTRAÇÃO DE METADADOS EM MÚLTIPLOS NÍVEIS (RESILIÊNCIA):
+   Como a estrutura HTML do Instagram muda muito, extraia os dados combinando 3 métodos:
+   - Método A (JSON-LD): Busque tags <script type="application/ld+json"> que contenham VideoObject para ler views, likes, legenda, data e thumbnail de forma estruturada.
+   - Método B (Meta Tags Open Graph): Leia og:description (para extrair likes e legenda usando regex), og:image, og:video:duration e article:published_time.
+   - Método C (DOM Fallback): Seletores genéricos para obter o datetime da tag <time>, spans de visualizações que batam com regex numérico, etc.
+
+4. COMPORTAMENTO INCREMENTAL E CHECKPOINTS:
+   - O scraper deve ler o arquivo `resources/videos/<username>/lista.csv` antes de iniciar.
+   - Obtenha os shortcodes já existentes. Na coleta, ignore e pule a abertura de posts que já estejam na lista de shortcodes conhecidos (incremental).
+   - Salve checkpoints do CSV a cada 10 vídeos coletados com sucesso para evitar perda de dados se o script falhar por rate-limiting no meio do processo.
+   - Sempre faça o merge dos dados novos com os antigos no encerramento (mesmo se ocorrer falha parcial), salvando no formato de CSV com cabeçalho contendo exatamente as colunas:
+     shortcode,url,published_at,timestamp,likes,views,duration,caption,thumbnail,username,type
+   - Ordene o CSV final de forma decrescente por timestamp (vídeos mais recentes primeiro).
+
+5. RETENTATIVAS (RETRY):
+   - Envolva as navegações individuais de páginas de posts e do perfil em um helper de retentativas que realiza de 2 a 3 tentativas com backoff exponencial (ex: 2s, 4s, 8s) em caso de falha de conexão ou timeout.
+
+6. DUAL-MODE (CLI & MCP):
+   - Se o script for chamado com argumentos (ex: `node index.js <username> [--visible]`), deve rodar no modo CLI exibindo um resumo formatado das estatísticas no terminal. O parâmetro `--visible` deve rodar o Playwright com `headless: false` para debug visual.
+   - Se foi chamado sem argumentos, deve iniciar o servidor do SDK de MCP via StdioTransport, disponibilizando a ferramenta `listar_videos_instagram` com os parâmetros `username` e `headless` (boolean, default true).
+
+## Requisitos de Implementação
+
+1. INSTALAÇÃO E CONFIGURAÇÃO:
+   - O `package.json` deve incluir no `postinstall`: `"npx playwright install chromium"` para garantir que o Chromium esteja disponível mesmo após o clone.
+
+2. NAVEGAÇÃO E ANTI-DETECÇÃO:
+   - Use `puppeteer-extra` com o plugin `stealth` para ajudar a evitar a detecção de automação.
+   - Configure os argumentos do launcher para incluir `--disable-blink-features=AutomationControlled`, `--disable-extensions`, `--disable-infobars`.
+   - Defina `user-agent` realista do Chrome no Linux (ex: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36).
+   - Configure o locale para `pt-BR,pt-BR` e timezone para `America/Sao_Paulo`.
+   - Configure o viewport para `1280x900`.
+   - No Playwright, use `context.addInitScript()` para desabilitar fonts web (`import { webkit } from 'playwright'; webkit.launch({ ... });`) e defina o interceptor de requests para bloquear somente `*.woff` e `*.woff2`.
+
+3. GERENCIAMENTO DE SESSÕES E COOKIES:
+   - Implemente o uso de `context.storageState()` para persistir cookies entre execuções (cache). Salve e carregue o estado de sessão em `resources/data/session.json`. Isso é crucial para não ser bloqueado rapidamente.
+
+4. ESTRUTURA DE PASTAS:
+   - Crie uma estrutura clara e consistente:
+     - `resources/mcps/instagram-videos/` (código-fonte do MCP)
+     - `resources/mcps/instagram-videos/lib/` (módulos auxiliares)
+     - `resources/videos/<username>/` (arquivos CSV e dados)
+     - `resources/data/` (para arquivos de sessão/cache e logs)
+     - `resources/prompts/` (para armazenar prompts de MCP, se necessário)
+
+5. PROCESSAMENTO DE PERFIL:
+   - Ao carregar o perfil, certifique-se de esperar pelo carregamento completo do DOM e de elementos de interação (como o botão de fechar cookies). Use `page.waitForSelector()` com timeout adequado antes de iniciar o scroll.
+
+6. MANUSEIO DE MODAIS (IMPORTANTE):
+   - O MCP deve primeiro identificar e fechar o modal de cookies e/ou o modal de login que o Instagram frequentemente exibe logo ao carregar a página. Se não puder fechar, pelo menos certifique-se de que o scroll não esteja travado.
+
+7. LOGGING:
+   - Todos os logs, warnings e erros devem ser direcionados para `stderr` para evitar corrupção do canal stdio do MCP.
+   - Mantenha o formato de log limpo, timestampado e legível.
+
+8. TESTES (Opcional mas Recomendado):
+   - Para validar o funcionamento sem bloqueios iniciais, recomenda-se testar em um perfil que não seja muito ativo (baixo engajamento) e usar o parâmetro `--visible` para monitorar visualmente o processo de coleta de dados.
+
